@@ -13,8 +13,10 @@
 //////////////////////////////////////////////////////////////////////////
 // AMenuSystemCharacter
 
-AMenuSystemCharacter::AMenuSystemCharacter()	:
-	m_CreateSessionCompleteDelegate(FOnCreateSessionCompleteDelegate::CreateUObject(this, &ThisClass::OnCreateSessionComplete))
+AMenuSystemCharacter::AMenuSystemCharacter() :
+	m_CreateSessionCompleteDelegate(FOnCreateSessionCompleteDelegate::CreateUObject(this, &ThisClass::OnCreateSessionComplete)),
+	m_FindSessionsCompleteDelegate(FOnFindSessionsCompleteDelegate::CreateUObject(this, &ThisClass::OnFindSessionsComplete)),
+	m_JoinSessionCompleteDelegate(FOnJoinSessionCompleteDelegate::CreateUObject(this, &ThisClass::OnJoinSessionComplete))
 {
 	// Set size for collision capsule
 	GetCapsuleComponent()->InitCapsuleSize(42.f, 96.0f);
@@ -143,10 +145,55 @@ void AMenuSystemCharacter::CreateGameSession()
 	SessionSettings->bShouldAdvertise = true;
 	// 현재 지역에서 진행중인 세션을 찾는다
 	SessionSettings->bUsesPresence = true;
+	SessionSettings->bUseLobbiesIfAvailable = true;
+
+	// 키와 벨류로 세션 매치 타입을 지정
+	// EOnlineDataAdvertisementType 는 광고 옵션을 지정
+	// ViaOnlineServiceAndPing은 온라인 서비스와 핑으로 광고할 수 있다,
+	SessionSettings->Set(FName("MatchType"), FString("FreeForAll"), EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
+
 	// 로컬 플레이어를 얻어와 넷ID를 얻을 수 있다.
 	const ULocalPlayer* LocalPlayer = GetWorld()->GetFirstLocalPlayerFromController();
 	// 세션 생성
 	m_OnlineSessionInterface->CreateSession(*LocalPlayer->GetPreferredUniqueNetId(), NAME_GameSession, *SessionSettings);
+}
+
+void AMenuSystemCharacter::JoinGameSession()
+{
+	// 게임 세션을 찾는다
+	// 인터페이스의 데이터가 유효하지 않다면 리턴
+	if (!m_OnlineSessionInterface.IsValid())
+	{
+		return;
+	}
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			-1,
+			15.f,
+			FColor::Blue,
+			FString(TEXT("JoinGameSession() Success"))
+		);
+	}
+
+	// 델리게이트리스트에 델리게이트 저장
+	m_OnlineSessionInterface->AddOnFindSessionsCompleteDelegate_Handle(m_FindSessionsCompleteDelegate);
+
+	m_SessionSearch = MakeShareable(new FOnlineSessionSearch());
+	// 세션을 찾을 개수?
+	m_SessionSearch->MaxSearchResults = 10000;
+	// LAN을 사용하지 않기떄문에 false
+	m_SessionSearch->bIsLanQuery = false;
+	// 매칭 서버를 찾기 위한 쿼리
+	// Find 세션을 호출하고 세션 검색을 전달하면 쿼리 세팅을 설정해서 우리가 찾는 세션을 사용하도록 함?
+	m_SessionSearch->QuerySettings.Set(SEARCH_PRESENCE, true, EOnlineComparisonOp::Equals);
+
+	// 로컬 플레이어를 얻어와 넷ID를 얻을 수 있다.
+	const ULocalPlayer* LocalPlayer = GetWorld()->GetFirstLocalPlayerFromController();
+
+	// 세션을 호출하고 세션이 완료되면 응답으로 콜백함수를 호출 요청
+	m_OnlineSessionInterface->FindSessions(*LocalPlayer->GetPreferredUniqueNetId(), m_SessionSearch.ToSharedRef());
 }
 
 void AMenuSystemCharacter::OnCreateSessionComplete(FName SessionName, bool bWasSuccessful)
@@ -162,6 +209,13 @@ void AMenuSystemCharacter::OnCreateSessionComplete(FName SessionName, bool bWasS
 				FString::Printf(TEXT("Created session : %s"), *SessionName.ToString())
 			);
 		}
+
+		UWorld* World = GetWorld();
+
+		if (World)
+		{
+			World->ServerTravel(FString("/Game/ThirdPerson/Maps/Lobby?listen"));
+		}
 	}
 	else
 	{
@@ -173,6 +227,84 @@ void AMenuSystemCharacter::OnCreateSessionComplete(FName SessionName, bool bWasS
 				FColor::Red,
 				FString(TEXT("Failed to create session!"))
 			);
+		}
+	}
+}
+
+void AMenuSystemCharacter::OnFindSessionsComplete(bool bWasSuccessful)
+{
+	// 인터페이스가 유효한지
+	if (!m_OnlineSessionInterface.IsValid())
+		return;
+
+	for (auto Result : m_SessionSearch->SearchResults)
+	{
+		// 세션 ID 문자열을 해당 함수로 얻을 수 있다.
+		FString Id = Result.GetSessionIdStr();
+		FString User = Result.Session.OwningUserName;
+		FString MatchType;
+
+		// 위에서 저장한 MatchType의 키값으로 저장된 Value값을 MatchType이란 FString변수에 저장
+		Result.Session.SessionSettings.Get(FName("MatchType"), MatchType);
+
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				-1,
+				15.f,
+				FColor::Cyan,
+				FString::Printf(TEXT("Id : %s, User : %s"), *Id, *User)
+			);
+		}
+
+		// IP주소를 얻어내려면 세션에 참여해야한다
+		// 세션이 맞을경우 아래의 if문에 들어감
+		if (MatchType == FString("FreeForAll"))
+		{
+			if (GEngine)
+			{
+				GEngine->AddOnScreenDebugMessage(
+					-1,
+					15.f,
+					FColor::Cyan,
+					FString::Printf(TEXT("Joining Match Type : %s"), *MatchType)
+				);
+			}
+
+			m_OnlineSessionInterface->AddOnJoinSessionCompleteDelegate_Handle(m_JoinSessionCompleteDelegate);
+
+			// JoinSession 호출
+			const ULocalPlayer* LocalPlayer = GetWorld()->GetFirstLocalPlayerFromController();
+			// 세션을 호출하고 세션이 완료되면 응답으로 콜백함수를 호출 요청
+			m_OnlineSessionInterface->JoinSession(*LocalPlayer->GetPreferredUniqueNetId(), NAME_GameSession, Result);
+		}
+	}
+}
+
+void AMenuSystemCharacter::OnJoinSessionComplete(FName SessionName, EOnJoinSessionCompleteResult::Type Result)
+{
+	if (!m_OnlineSessionInterface.IsValid())
+		return;
+
+	// 세션의 IP주소를 얻어온다.
+	// 세션에 등록된 IP주소를 얻어오기 때문에 IP주소를 직접 알아내서 적을 필요가없다.
+	FString Address;
+	if (m_OnlineSessionInterface->GetResolvedConnectString(NAME_GameSession, Address))
+	{
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				-1,
+				15.f,
+				FColor::Yellow,
+				FString::Printf(TEXT("Connect string : %s"), *Address)
+			);
+		}
+
+		APlayerController* PlayerController = GetGameInstance()->GetFirstLocalPlayerController();
+		if (PlayerController)
+		{
+			PlayerController->ClientTravel(Address, ETravelType::TRAVEL_Absolute);
 		}
 	}
 }
